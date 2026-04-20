@@ -203,31 +203,61 @@ export function buildBehaviorProfile(personName: string): BehaviorProfile | null
 
 export function buildDeterministicPrediction(profile: BehaviorProfile, proposal: string) {
   const lower = proposal.toLowerCase()
-
-  const risky = /risk|delay|refactor|migration|rewrite|uncertain|experiment|slow|remove|cut|skip|reduce/.test(lower)
-  const commercial = /customer|revenue|enterprise|adoption|sales|market|deal|close|pipeline/.test(lower)
-  const technical = /api|infra|latency|architecture|system|bug|webhook|patch|code|engineering/.test(lower)
-  const people = /hire|candidate|onboard|culture|team|process|interview|retention|growth/.test(lower)
-  const speed = /faster|speed|quick|accelerate|compress|cut time|reduce time/.test(lower)
-
+  const ev = profile.evidence
   const r = profile.radarScores
 
+  // Score the proposal across dimensions purely from text
+  const proposalWords = lower.split(/\s+/).filter(Boolean)
+  const wc = proposalWords.length
+
+  // Proposal feature scores — purely lexical, no person assumptions
+  const proposalRiskScore = proposalWords.filter(w =>
+    /risk|delay|refactor|rewrite|uncertain|remove|cut|skip|reduce|slower|drop|eliminate|cancel/.test(w)
+  ).length / Math.max(wc, 1)
+
+  const proposalActionScore = proposalWords.filter(w =>
+    /ship|launch|build|deliver|execute|faster|speed|accelerate|compress|cut|reduce|improve|implement/.test(w)
+  ).length / Math.max(wc, 1)
+
+  const proposalPeopleScore = proposalWords.filter(w =>
+    /hire|candidate|onboard|culture|team|interview|retention|growth|experience|person|people|trust/.test(w)
+  ).length / Math.max(wc, 1)
+
+  const proposalTechScore = proposalWords.filter(w =>
+    /api|infra|latency|architecture|system|bug|webhook|patch|code|engineering|backend|frontend|database/.test(w)
+  ).length / Math.max(wc, 1)
+
+  const proposalCommercialScore = proposalWords.filter(w =>
+    /customer|revenue|enterprise|adoption|sales|market|deal|pipeline|close|conversion/.test(w)
+  ).length / Math.max(wc, 1)
+
+  // Alignment: how much does the proposal match what this person cares about?
+  // Derived purely from their measured evidence rates
+  const personPeopleOrientation = ev.empathyRate * 0.5 + ev.collaborationRate * 0.3 + ev.peopleRate * 0.2
+  const personTechOrientation = ev.technicalRate * 0.7 + ev.strategicRate * 0.3
+  const personRiskSensitivity = ev.riskRate * 0.6 + ev.hedgeRate * 0.4
+  const personActionOrientation = ev.actionRate * 0.6 + ev.certaintyRate * 0.4
+  const personDataOrientation = ev.dataRate * 0.7 + ev.strategicRate * 0.3
+
+  // Approval: rises when proposal aligns with person orientation, falls when mismatched
   let approve = 50
+  approve += (proposalPeopleScore - 0.05) * personPeopleOrientation * 120
+  approve += (proposalTechScore - 0.05) * personTechOrientation * 100
+  approve += (proposalCommercialScore - 0.03) * personActionOrientation * 90
+  approve += proposalActionScore * personActionOrientation * 60
+  approve -= proposalRiskScore * personRiskSensitivity * 140
+  approve += (r.collaboration - 50) * 0.1
+
   let pushback = 25
+  pushback += proposalRiskScore * personRiskSensitivity * 160
+  pushback += (r.directness - 50) * 0.08
+  pushback -= proposalPeopleScore * personPeopleOrientation * 80
+  pushback -= proposalCommercialScore * personActionOrientation * 60
+
   let defer = 25
-
-  approve += (r.collaboration - 50) * 0.12
-  approve += commercial ? 10 : 0
-  approve += speed && r.urgency > 65 ? 8 : 0
-  approve += people && r.empathy > 65 ? 10 : 0
-
-  pushback += risky ? 18 : 0
-  pushback += (70 - r.riskTolerance) * 0.2
-  pushback += r.directness > 70 ? 6 : 0
-  pushback += people && r.empathy > 70 ? -8 : 0
-
-  defer += risky && r.strategicThinking > 70 ? 6 : 0
-  defer += commercial ? -4 : 0
+  defer += proposalRiskScore * (r.strategicThinking - 50) * 0.08
+  defer -= proposalActionScore * personActionOrientation * 40
+  defer -= proposalCommercialScore * 10
 
   approve = Math.max(5, Math.round(approve))
   pushback = Math.max(5, Math.round(pushback))
@@ -240,40 +270,79 @@ export function buildDeterministicPrediction(profile: BehaviorProfile, proposal:
 
   const initialReaction =
     approve >= 55 ? 'interested but probing' :
-    pushback >= 45 ? 'skeptical' : 'cautious'
+    pushback >= 42 ? 'skeptical' : 'cautious'
 
-  const likelyFirstQuestion =
-    people && r.empathy > 65 ? "What's the candidate or team experience impact, and how will we measure it?" :
-    risky && r.riskTolerance < 55 ? "What's the downside scenario and how do we contain execution risk?" :
-    commercial ? "What's the concrete customer or business upside, and how quickly will we validate it?" :
-    technical ? "What's the implementation scope and what breaks if we do this now?" :
-    "What's the specific upside, and what tradeoff are we accepting to get it?"
+  // First question: derived from highest-scoring dimension of THIS person vs proposal mismatch
+  // Person with high people orientation + risky people proposal → asks about experience impact
+  // Person with high risk sensitivity + risky proposal → asks about downside
+  // Person with high tech orientation + tech proposal → asks about implementation
+  // Person with high data orientation → asks for the numbers
+  const questionScores = [
+    { q: "What happens to the people in this — and how do we measure the impact on their experience?", score: personPeopleOrientation * 2 + proposalPeopleScore },
+    { q: "What exactly is the downside scenario and how do we contain execution risk?", score: personRiskSensitivity * 2 + proposalRiskScore },
+    { q: "What is the implementation scope and what dependencies break if we move on this now?", score: personTechOrientation * 2 + proposalTechScore },
+    { q: "What is the concrete business upside and what is the fastest way to validate it?", score: personActionOrientation * 2 + proposalCommercialScore },
+    { q: "Do you have the data on this — and what does success look like in measurable terms?", score: personDataOrientation * 2 },
+  ]
+  questionScores.sort((a, b) => b.score - a.score)
+  const likelyFirstQuestion = questionScores[0].q
 
-  const potentialObjection =
-    risky ? "The proposal introduces risk or complexity without a tight enough mitigation plan." :
-    r.urgency > 65 && !speed ? "This timeline isn't moving fast enough relative to the opportunity." :
-    people && r.empathy > 70 ? "The people or experience dimension of this change needs more thought." :
-    "The success metric needs to be sharper before we commit."
+  // Objection: derived from what the person cares about most vs what the proposal is weakest on
+  const objectionScores = [
+    { o: "The impact on people and experience has not been thought through carefully enough.", score: personPeopleOrientation * 3 + proposalRiskScore },
+    { o: "The execution risk here is real and the mitigation plan is not tight enough.", score: personRiskSensitivity * 3 + proposalRiskScore },
+    { o: "The technical dependencies and failure modes have not been mapped out.", score: personTechOrientation * 2 + proposalTechScore * 0.5 },
+    { o: "There is no clear success metric and the scope needs to be tighter before we commit.", score: personDataOrientation * 2 + proposalRiskScore },
+    { o: "This does not move fast enough relative to what we need to deliver.", score: personActionOrientation * 2 - proposalActionScore },
+  ]
+  objectionScores.sort((a, b) => b.score - a.score)
+  const potentialObjection = objectionScores[0].o
 
-  const howToFrameIt =
-    people && r.empathy > 65 ? "Lead with the human impact and the measurable experience improvement. Include a timeline and a way to track success." :
-    commercial ? "Lead with customer impact and the smallest credible path to measurable value." :
-    technical ? "Lead with implementation scope, risk containment, and why this is the highest leverage move now." :
-    "Lead with the tradeoff, expected outcome, and a concrete validation plan."
+  // Framing advice: what to lead with given this person orientation
+  const framingScores = [
+    { f: "Lead with the measurable impact on people and experience, with a concrete way to track it.", score: personPeopleOrientation },
+    { f: "Lead with the downside case fully mapped and a specific mitigation plan.", score: personRiskSensitivity + proposalRiskScore },
+    { f: "Lead with the technical implementation scope, dependencies, and risk containment.", score: personTechOrientation + proposalTechScore },
+    { f: "Lead with the business outcome, the speed of validation, and the smallest credible path to value.", score: personActionOrientation + proposalCommercialScore },
+    { f: "Lead with the data behind the proposal — benchmarks, success metrics, and evidence from comparable situations.", score: personDataOrientation },
+  ]
+  framingScores.sort((a, b) => b.score - a.score)
+  const howToFrameIt = framingScores[0].f
 
-  const keyPhrasesToUse =
-    people && r.empathy > 65 ? ['candidate experience', 'trust', 'measurable impact'] :
-    commercial ? ['customer impact', 'concrete tradeoff', 'revenue signal'] :
-    ['execution risk', 'concrete tradeoff', 'clear success metric']
+  // Phrases to use: top dimensions of this person
+  const dimensionMap = [
+    { phrases: ['people impact', 'candidate experience', 'trust'], score: personPeopleOrientation },
+    { phrases: ['execution risk', 'mitigation plan', 'downside scenario'], score: personRiskSensitivity },
+    { phrases: ['technical scope', 'implementation risk', 'system dependencies'], score: personTechOrientation },
+    { phrases: ['concrete tradeoff', 'customer impact', 'revenue signal'], score: personActionOrientation },
+    { phrases: ['the data shows', 'measurable outcome', 'success metric'], score: personDataOrientation },
+  ]
+  dimensionMap.sort((a, b) => b.score - a.score)
+  const keyPhrasesToUse = dimensionMap[0].phrases
 
-  const keyPhrasesToAvoid =
-    r.directness > 65 ? ["we will figure it out", "this is probably fine", "no clear plan yet"] :
-    r.empathy > 68 ? ['just a process change', "people will adapt", 'efficiency first'] :
-    ["we'll figure it out later", 'this should be fine']
+  // Phrases to avoid: what this person finds hollow given their orientation
+  const avoidMap = [
+    { phrases: ['just a process change', 'people will adapt', 'efficiency over experience'], score: personPeopleOrientation },
+    { phrases: ['we will figure it out', 'this should be fine', 'no clear plan yet'], score: personRiskSensitivity },
+    { phrases: ['probably fine technically', 'we can fix it later', 'not a big deal'], score: personTechOrientation },
+    { phrases: ['move fast and see', 'let us try it', 'we can course correct'], score: personDataOrientation },
+  ]
+  avoidMap.sort((a, b) => b.score - a.score)
+  const keyPhrasesToAvoid = avoidMap[0].phrases
+
+  // Reaction reason: purely from top dimension
+  const topDimension =
+    personPeopleOrientation > personRiskSensitivity && personPeopleOrientation > personTechOrientation && personPeopleOrientation > personDataOrientation
+      ? 'people impact, trust, and the quality of the experience being created'
+      : personRiskSensitivity > personTechOrientation && personRiskSensitivity > personDataOrientation
+      ? 'execution risk, downside scenarios, and mitigation quality'
+      : personTechOrientation > personDataOrientation
+      ? 'technical scope, system dependencies, and implementation realism'
+      : 'data, measurable outcomes, and evidence from comparable situations'
 
   return {
     initialReaction,
-    reactionReason: `${profile.personName} evaluates proposals through the lens of ${r.empathy > 68 ? 'people impact and process quality' : r.strategicThinking > 68 ? 'strategic tradeoffs and execution realism' : 'concrete outcomes and operational risk'}.`,
+    reactionReason: `${profile.personName} evaluates proposals through the lens of ${topDimension}.`,
     likelyFirstQuestion,
     potentialObjection,
     howToFrameIt,
